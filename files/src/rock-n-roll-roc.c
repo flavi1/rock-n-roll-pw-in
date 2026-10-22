@@ -385,33 +385,56 @@ int main(int argc, char **argv)
         /* rattrapage de la dérive d'horloge : le rééchantillonneur Speex échoue à
          * 192 kHz (« Ratio overflow ») ; celui de libroc fonctionne à toute fréquence */
         rcfg.resampler_backend = ROC_RESAMPLER_BACKEND_BUILTIN;
-        roc_receiver *rcv = NULL;
-        if (roc_receiver_open(ctx, &rcfg, &rcv) != 0)
-            die("roc_receiver_open a échoué");
+        /* Un récepteur par protocole (libroc refuse de les mêler dans un même
+         * récepteur) : flux corrigé (rs8m) si disponible, et flux simple. Leurs
+         * sorties sont additionnées (un seul émetteur à la fois : pare-feu). */
+        roc_receiver *rcv[2] = { NULL, NULL };
         int n = 0;
+        const char *fecs[2] = { fec, NULL };
+        int ports[2] = { !strcmp(fec, "none") ? (int)pport : (int)sport, 0 };
         if (!strcmp(fec, "auto")) {
-            n += bind_slot(rcv, 0, "rs8m", bind_ip, (int)sport, (int)rport, desc, sizeof(desc));
-            if (!n)
-                fprintf(stderr, "rock-n-roll-roc : correction d'erreur indisponible dans cette libroc : "
-                                "flux sans correction seulement\n");
-            n += bind_slot(rcv, 1, "none", bind_ip, (int)pport, 0, desc, sizeof(desc));
-        } else {
-            n += bind_slot(rcv, 0, fec, bind_ip, !strcmp(fec, "none") ? (int)pport : (int)sport,
-                           (int)rport, desc, sizeof(desc));
+            fecs[0] = "rs8m"; ports[0] = (int)sport;
+            fecs[1] = "none"; ports[1] = (int)pport;
+        }
+        for (int k = 0; k < 2; k++) {
+            if (!fecs[k])
+                continue;
+            if (roc_receiver_open(ctx, &rcfg, &rcv[k]) != 0)
+                die("roc_receiver_open a échoué");
+            if (bind_slot(rcv[k], ROC_SLOT_DEFAULT, fecs[k], bind_ip, ports[k], (int)rport,
+                          desc, sizeof(desc))) {
+                n++;
+            } else {
+                roc_receiver_close(rcv[k]);
+                rcv[k] = NULL;
+                if (!strcmp(fecs[k], "rs8m") && !strcmp(fec, "auto"))
+                    fprintf(stderr, "rock-n-roll-roc : correction d'erreur indisponible dans cette libroc : "
+                                    "flux sans correction seulement\n");
+            }
         }
         if (!n)
             die("écoute impossible (port déjà utilisé ? voir messages de libroc ci-dessus)");
         fprintf(stderr, "rock-n-roll-roc : écoute sur %s (%ld Hz, f32, stéréo, latence %ld ms)\n",
                 desc, rate, latency_ms);
 
+        float tmp[CHUNK_FRAMES * CHANNELS];
         int out = spawn(&argv[cmd], 1);
         while (!stop_requested) {
-            roc_frame f;
-            f.samples = buf;
-            f.samples_size = sizeof(buf);
-            /* sans émetteur : silence, le flux reste en place */
-            if (roc_receiver_read(rcv, &f) != 0)
-                memset(buf, 0, sizeof(buf));
+            int first = 1;
+            for (int k = 0; k < 2; k++) {
+                if (!rcv[k])
+                    continue;
+                roc_frame f;
+                f.samples = first ? buf : tmp;
+                f.samples_size = sizeof(buf);
+                /* sans émetteur : silence, le flux reste en place */
+                if (roc_receiver_read(rcv[k], &f) != 0)
+                    memset(f.samples, 0, sizeof(buf));
+                if (!first)
+                    for (size_t i = 0; i < CHUNK_FRAMES * CHANNELS; i++)
+                        buf[i] += tmp[i];
+                first = 0;
+            }
             if (write_all(out, buf, sizeof(buf)) != 0) {
                 if (!stop_requested) {
                     fprintf(stderr, "rock-n-roll-roc : la commande s'est arrêtée\n");
@@ -421,7 +444,9 @@ int main(int argc, char **argv)
             }
         }
         close(out);
-        roc_receiver_close(rcv);
+        for (int k = 0; k < 2; k++)
+            if (rcv[k])
+                roc_receiver_close(rcv[k]);
     }
 
     stop_child();

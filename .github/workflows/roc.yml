@@ -37,22 +37,19 @@ jobs:
         run: ROC_CASE="u2404 seul" bash tests/test-roc.sh pair "env BIN=$PWD/r-u2404" "env BIN=$PWD/r-u2404"
       - name: "Debian trixie (la Pi), sans perte"
         run: ROC_CASE="trixie seul" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie"
+      - name: "Ubuntu 26.04 (libroc 0.4), sans perte"
+        run: ROC_CASE="u2604 seul" bash tests/test-roc.sh pair "docker exec u2604 env BIN=/w/r-u2604" "docker exec u2604 env BIN=/w/r-u2604"
+      - name: "Pi (trixie 0.3) reçoit, PC 24.04 (0.3 sans correction) envoie"
+        run: ROC_CASE="trixie <- u2404" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "env BIN=$PWD/r-u2404"
+      - name: "Pi (trixie 0.3) reçoit, PC 26.04 (0.4) envoie"
+        run: ROC_CASE="trixie <- u2604" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
       - name: "Pertes simulées : 5 %"
         run: sudo tc qdisc add dev lo root netem loss 5%
       - name: "Debian trixie, 5 % de pertes : corrigées"
         run: ROC_CASE="trixie 5%" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie"
       - name: "Debian trixie, 5 % de pertes, sans correction : le banc les voit"
         run: ROC_CASE="trixie 5% none" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie" none glitches
-      - name: "Ubuntu 26.04 (libroc 0.4), 5 % de pertes"
-        continue-on-error: true
-        run: ROC_CASE="u2604 5%" bash tests/test-roc.sh pair "docker exec u2604 env BIN=/w/r-u2604" "docker exec u2604 env BIN=/w/r-u2604"
-      - name: "Pi (trixie 0.3) reçoit, PC (26.04 0.4) envoie, 5 % de pertes"
-        continue-on-error: true
-        run: ROC_CASE="trixie <- u2604 5%" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
+      - name: "Pi (trixie) reçoit, PC 26.04 (sans correction) envoie, 5 % de pertes : audibles"
+        run: ROC_CASE="trixie <- u2604 5%" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604" auto glitches
       - name: "Sans pertes simulées"
         run: sudo tc qdisc del dev lo root
-      - name: "Pi (trixie) reçoit, PC sans correction (24.04) envoie : flux simple"
-        run: ROC_CASE="trixie <- u2404" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "env BIN=$PWD/r-u2404"
-      - name: "Pi (trixie 0.3) reçoit, PC (26.04 0.4) envoie, sans perte"
-        continue-on-error: true
-        run: ROC_CASE="trixie <- u2604" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
