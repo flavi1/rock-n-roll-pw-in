@@ -17,6 +17,7 @@ jobs:
   roc:
     name: Envoi / réception réels (0.3, 0.4, avec et sans correction)
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     env:
       SECS: "11"
     steps:

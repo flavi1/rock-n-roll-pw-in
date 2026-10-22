@@ -72,12 +72,15 @@ pair() {   # pair PRÉFIXE-RÉCEPTION PRÉFIXE-ENVOI FEC ATTENDU
     local res=roc-res.json rlog slog rp sp
     rlog="$(mktemp)" slog="$(mktemp)"
     rm -f "$res"
+    local lim=$((SECS + 40))
+    # délais : un essai bloqué ne doit jamais bloquer la CI ; sorties détachées
+    # (un processus orphelin qui garde la sortie de l'étape la bloquerait)
     # shellcheck disable=SC2086
-    $rpre bash tests/test-roc.sh recv "$res" "$fec" 2>"$rlog" & rp=$!
+    timeout -k 5 "$lim" $rpre bash tests/test-roc.sh recv "$res" "$fec" >/dev/null 2>"$rlog" </dev/null & rp=$!
     sleep 1.5
     # shellcheck disable=SC2086
-    $spre bash tests/test-roc.sh send 127.0.0.1 "$fec" 2>"$slog" & sp=$!
-    wait "$rp" || true
+    timeout -k 5 "$lim" $spre bash tests/test-roc.sh send 127.0.0.1 "$fec" >/dev/null 2>"$slog" </dev/null & sp=$!
+    wait "$rp" || echo "réception : code $?" >>"$rlog"
     kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
     echo "== $ROC_CASE (FEC $fec, attendu : $want)"
     cat "$rlog" "$slog" >&2
