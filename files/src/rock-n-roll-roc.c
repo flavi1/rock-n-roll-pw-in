@@ -19,9 +19,16 @@
  *        reçoit et écrit le son brut sur l'entrée de la commande
  *
  *  Options : --source-port N (10001)  --repair-port N (10002)
- *            --fec rs8m|ldpc|none (rs8m)  --rate HZ (192000)
+ *            --plain-port N (10003 : flux sans correction)
+ *            --fec auto|rs8m|ldpc|none (auto)  --rate HZ (192000)
  *            --packet-us N (750, envoi)   --latency-ms N (80, réception)
  *            --bind IP (0.0.0.0, réception)  -v (journal détaillé)
+ *
+ *  Correction d'erreur : toutes les libroc ne l'ont pas (Ubuntu 24.04 : sans
+ *  OpenFEC). En « auto », la réception écoute le flux corrigé (rs8m, si
+ *  disponible) ET un flux simple ; l'envoi utilise rs8m si sa libroc le permet,
+ *  sinon le flux simple. Toutes les combinaisons fonctionnent ; la correction
+ *  n'est active que si les deux côtés l'ont.
  *
  *  Format sur le tube : flottant 32 bits, ordre de la machine, 2 canaux
  *  entrelacés (pw-cat --raw --format f32 --channels 2).
@@ -76,7 +83,8 @@ static void usage(void)
     fprintf(stderr,
         "usage : rock-n-roll-roc send --host IP [options] -- COMMANDE...\n"
         "        rock-n-roll-roc recv [options] -- COMMANDE...\n"
-        "options : --source-port N --repair-port N --fec rs8m|ldpc|none --rate HZ\n"
+        "options : --source-port N --repair-port N --plain-port N\n"
+        "          --fec auto|rs8m|ldpc|none --rate HZ\n"
         "          --packet-us N (envoi) --latency-ms N --bind IP (réception) -v\n");
     exit(2);
 }
@@ -180,6 +188,66 @@ static roc_endpoint *endpoint(const char *uri)
     return ep;
 }
 
+/* Ouvre l'émetteur avec la correction demandée ; 0 si impossible (libroc sans
+ * cette correction). */
+static roc_sender *open_sender(roc_context *ctx, const roc_media_encoding *enc,
+                               long packet_us, const char *fec, const char *host,
+                               int sport, int rport, int pport, char *desc, size_t n)
+{
+    char src[128], rep[128];
+    roc_fec_encoding fe;
+    make_uris(fec, host, !strcmp(fec, "none") ? pport : sport, rport, src, rep, sizeof(src), &fe);
+    roc_sender_config sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.frame_encoding = *enc;
+    sc.packet_encoding = (roc_packet_encoding)ENCODING_ID;
+    sc.packet_length = (unsigned long long)packet_us * 1000ULL;
+    sc.fec_encoding = fe;
+    /* le rythme est celui de la commande (PipeWire), pas une horloge interne */
+    sc.clock_source = ROC_CLOCK_SOURCE_EXTERNAL;
+    roc_sender *snd = NULL;
+    if (roc_sender_open(ctx, &sc, &snd) != 0)
+        return NULL;
+    roc_endpoint *es = endpoint(src);
+    int bad = roc_sender_connect(snd, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_SOURCE, es) != 0;
+    roc_endpoint_deallocate(es);
+    if (!bad && rep[0]) {
+        roc_endpoint *er = endpoint(rep);
+        bad = roc_sender_connect(snd, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_REPAIR, er) != 0;
+        roc_endpoint_deallocate(er);
+    }
+    if (bad) {
+        roc_sender_close(snd);
+        return NULL;
+    }
+    snprintf(desc, n, "%s%s%s", src, rep[0] ? " + " : "", rep);
+    return snd;
+}
+
+/* Écoute un flux (slot) ; 0 si impossible. */
+static int bind_slot(roc_receiver *rcv, roc_slot slot, const char *fec, const char *ip,
+                     int sport, int rport, char *desc, size_t n)
+{
+    char src[128], rep[128];
+    roc_fec_encoding fe;
+    make_uris(fec, ip, sport, rport, src, rep, sizeof(src), &fe);
+    roc_endpoint *es = endpoint(src);
+    int bad = roc_receiver_bind(rcv, slot, ROC_INTERFACE_AUDIO_SOURCE, es) != 0;
+    roc_endpoint_deallocate(es);
+    if (!bad && rep[0]) {
+        roc_endpoint *er = endpoint(rep);
+        bad = roc_receiver_bind(rcv, slot, ROC_INTERFACE_AUDIO_REPAIR, er) != 0;
+        roc_endpoint_deallocate(er);
+    }
+    if (bad) {
+        roc_receiver_unlink(rcv, slot);
+        return 0;
+    }
+    size_t l = strlen(desc);
+    snprintf(desc + l, n - l, "%s%s%s%s", l ? " ; " : "", src, rep[0] ? " + " : "", rep);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -189,8 +257,8 @@ int main(int argc, char **argv)
     if (!sending && strcmp(mode, "recv"))
         usage();
 
-    const char *host = NULL, *bind_ip = "0.0.0.0", *fec = "rs8m";
-    long sport = 10001, rport = 10002, rate = 192000, packet_us = 750, latency_ms = 80;
+    const char *host = NULL, *bind_ip = "0.0.0.0", *fec = "auto";
+    long sport = 10001, rport = 10002, pport = 10003, rate = 192000, packet_us = 750, latency_ms = 80;
     int verbose = 0, cmd = -1;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
@@ -204,6 +272,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--fec")) fec = v;
         else if (!strcmp(a, "--source-port")) sport = parse_num(v, 1, 65535, "--source-port");
         else if (!strcmp(a, "--repair-port")) rport = parse_num(v, 1, 65535, "--repair-port");
+        else if (!strcmp(a, "--plain-port")) pport = parse_num(v, 1, 65535, "--plain-port");
         else if (!strcmp(a, "--rate")) rate = parse_num(v, 8000, 768000, "--rate");
         else if (!strcmp(a, "--packet-us")) packet_us = parse_num(v, 100, 20000, "--packet-us");
         else if (!strcmp(a, "--latency-ms")) latency_ms = parse_num(v, 5, 5000, "--latency-ms");
@@ -214,6 +283,8 @@ int main(int argc, char **argv)
         usage();
     if (sending && !host)
         die("--host obligatoire pour l'envoi");
+    if (strcmp(fec, "auto") && strcmp(fec, "rs8m") && strcmp(fec, "ldpc") && strcmp(fec, "none"))
+        die("--fec doit valoir auto, rs8m, ldpc ou none");
 
     /* paquet : son + en-têtes RTP / FEC / IP / UDP, sous la taille d'un paquet réseau */
     long payload = rate * packet_us / 1000000 * FRAME_BYTES;
@@ -245,38 +316,30 @@ int main(int argc, char **argv)
     if (roc_context_register_encoding(ctx, ENCODING_ID, &enc) != 0)
         die("roc_context_register_encoding a échoué (libroc trop ancienne ?)");
 
-    char src_uri[128], rep_uri[128];
-    roc_fec_encoding fec_enc;
-    make_uris(fec, sending ? host : bind_ip, (int)sport, (int)rport,
-              src_uri, rep_uri, sizeof(src_uri), &fec_enc);
-
+    char desc[512] = "";
     float buf[CHUNK_FRAMES * CHANNELS];
     int rc = 0;
 
     if (sending) {
-        roc_sender_config sc;
-        memset(&sc, 0, sizeof(sc));
-        sc.frame_encoding = enc;
-        sc.packet_encoding = (roc_packet_encoding)ENCODING_ID;
-        sc.packet_length = (unsigned long long)packet_us * 1000ULL;
-        sc.fec_encoding = fec_enc;
-        /* le rythme est celui de la commande (PipeWire), pas une horloge interne */
-        sc.clock_source = ROC_CLOCK_SOURCE_EXTERNAL;
         roc_sender *snd = NULL;
-        if (roc_sender_open(ctx, &sc, &snd) != 0)
-            die("roc_sender_open a échoué");
-        roc_endpoint *es = endpoint(src_uri);
-        if (roc_sender_connect(snd, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_SOURCE, es) != 0)
-            die("connexion (source) impossible");
-        roc_endpoint_deallocate(es);
-        if (rep_uri[0]) {
-            roc_endpoint *er = endpoint(rep_uri);
-            if (roc_sender_connect(snd, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_REPAIR, er) != 0)
-                die("connexion (réparation) impossible");
-            roc_endpoint_deallocate(er);
+        const char *used = fec;
+        if (!strcmp(fec, "auto")) {
+            used = "rs8m";
+            snd = open_sender(ctx, &enc, packet_us, "rs8m", host, (int)sport, (int)rport, (int)pport,
+                              desc, sizeof(desc));
+            if (!snd) {
+                fprintf(stderr, "rock-n-roll-roc : correction d'erreur indisponible dans cette libroc : "
+                                "flux sans correction\n");
+                used = "none";
+            }
         }
-        fprintf(stderr, "rock-n-roll-roc : envoi vers %s%s%s (%ld Hz, f32, stéréo, paquets de %ld µs)\n",
-                src_uri, rep_uri[0] ? " + " : "", rep_uri, rate, packet_us);
+        if (!snd)
+            snd = open_sender(ctx, &enc, packet_us, used, host, (int)sport, (int)rport, (int)pport,
+                              desc, sizeof(desc));
+        if (!snd)
+            die("ouverture de l'envoi impossible (voir messages de libroc ci-dessus)");
+        fprintf(stderr, "rock-n-roll-roc : envoi vers %s (%ld Hz, f32, stéréo, paquets de %ld µs)\n",
+                desc, rate, packet_us);
 
         int in = spawn(&argv[cmd], 0);
         size_t have = 0;
@@ -322,18 +385,21 @@ int main(int argc, char **argv)
         roc_receiver *rcv = NULL;
         if (roc_receiver_open(ctx, &rcfg, &rcv) != 0)
             die("roc_receiver_open a échoué");
-        roc_endpoint *es = endpoint(src_uri);
-        if (roc_receiver_bind(rcv, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_SOURCE, es) != 0)
-            die("écoute (source) impossible : port déjà utilisé ?");
-        roc_endpoint_deallocate(es);
-        if (rep_uri[0]) {
-            roc_endpoint *er = endpoint(rep_uri);
-            if (roc_receiver_bind(rcv, ROC_SLOT_DEFAULT, ROC_INTERFACE_AUDIO_REPAIR, er) != 0)
-                die("écoute (réparation) impossible : port déjà utilisé ?");
-            roc_endpoint_deallocate(er);
+        int n = 0;
+        if (!strcmp(fec, "auto")) {
+            n += bind_slot(rcv, 0, "rs8m", bind_ip, (int)sport, (int)rport, desc, sizeof(desc));
+            if (!n)
+                fprintf(stderr, "rock-n-roll-roc : correction d'erreur indisponible dans cette libroc : "
+                                "flux sans correction seulement\n");
+            n += bind_slot(rcv, 1, "none", bind_ip, (int)pport, 0, desc, sizeof(desc));
+        } else {
+            n += bind_slot(rcv, 0, fec, bind_ip, !strcmp(fec, "none") ? (int)pport : (int)sport,
+                           (int)rport, desc, sizeof(desc));
         }
-        fprintf(stderr, "rock-n-roll-roc : écoute sur %s%s%s (%ld Hz, f32, stéréo, latence %ld ms)\n",
-                src_uri, rep_uri[0] ? " + " : "", rep_uri, rate, latency_ms);
+        if (!n)
+            die("écoute impossible (port déjà utilisé ? voir messages de libroc ci-dessus)");
+        fprintf(stderr, "rock-n-roll-roc : écoute sur %s (%ld Hz, f32, stéréo, latence %ld ms)\n",
+                desc, rate, latency_ms);
 
         int out = spawn(&argv[cmd], 1);
         while (!stop_requested) {
