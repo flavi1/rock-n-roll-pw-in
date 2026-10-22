@@ -29,7 +29,8 @@ build() {
 
 # chemins relatifs : valables sur l'hôte et dans les conteneurs (/w = dépôt)
 recv() {   # recv FICHIER-BILAN [FEC]
-    "$BIN" recv --fec "${2:-auto}" --latency-ms 100 -- python3 tests/roc-sine.py check "$SECS" "$1"
+    # shellcheck disable=SC2086
+    "$BIN" recv --fec "${2:-auto}" --latency-ms 100 ${ROC_RECV_OPTS:-} -- python3 tests/roc-sine.py check "$SECS" "$1"
 }
 
 send() {   # send IP [FEC]

@@ -23,6 +23,9 @@
  *            --fec auto|rs8m|ldpc|none (auto)  --rate HZ (192000)
  *            --packet-us N (750, envoi)   --latency-ms N (80, réception)
  *            --bind IP (0.0.0.0, réception)  -v (journal détaillé)
+ *            --resampler builtin|speex|default (builtin)
+ *            --resampler-profile low|medium|high (medium)
+ *            --no-tuner (réception : pas de rattrapage de dérive d'horloge)
  *
  *  Correction d'erreur : toutes les libroc ne l'ont pas (Ubuntu 24.04 : sans
  *  OpenFEC). En « auto », la réception écoute le flux corrigé (rs8m, si
@@ -259,17 +262,21 @@ int main(int argc, char **argv)
 
     const char *host = NULL, *bind_ip = "0.0.0.0", *fec = "auto";
     long sport = 10001, rport = 10002, pport = 10003, rate = 192000, packet_us = 750, latency_ms = 80;
-    int verbose = 0, cmd = -1;
+    int verbose = 0, cmd = -1, tuner = 1;
+    const char *resampler = "builtin", *rprofile = "medium";
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         const char *v = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (!strcmp(a, "--")) { cmd = i + 1; break; }
         else if (!strcmp(a, "-v")) { verbose++; continue; }
+        else if (!strcmp(a, "--no-tuner")) { tuner = 0; continue; }
         if (!v)
             usage();
         if (!strcmp(a, "--host")) host = v;
         else if (!strcmp(a, "--bind")) bind_ip = v;
         else if (!strcmp(a, "--fec")) fec = v;
+        else if (!strcmp(a, "--resampler")) resampler = v;
+        else if (!strcmp(a, "--resampler-profile")) rprofile = v;
         else if (!strcmp(a, "--source-port")) sport = parse_num(v, 1, 65535, "--source-port");
         else if (!strcmp(a, "--repair-port")) rport = parse_num(v, 1, 65535, "--repair-port");
         else if (!strcmp(a, "--plain-port")) pport = parse_num(v, 1, 65535, "--plain-port");
@@ -384,7 +391,19 @@ int main(int argc, char **argv)
         rcfg.target_latency = (unsigned long long)latency_ms * 1000000ULL;
         /* rattrapage de la dérive d'horloge : le rééchantillonneur Speex échoue à
          * 192 kHz (« Ratio overflow ») ; celui de libroc fonctionne à toute fréquence */
-        rcfg.resampler_backend = ROC_RESAMPLER_BACKEND_BUILTIN;
+        rcfg.resampler_backend = !strcmp(resampler, "speex") ? ROC_RESAMPLER_BACKEND_SPEEX
+                               : !strcmp(resampler, "default") ? ROC_RESAMPLER_BACKEND_DEFAULT
+                               : ROC_RESAMPLER_BACKEND_BUILTIN;
+        rcfg.resampler_profile = !strcmp(rprofile, "high") ? ROC_RESAMPLER_PROFILE_HIGH
+                               : !strcmp(rprofile, "low") ? ROC_RESAMPLER_PROFILE_LOW
+                               : ROC_RESAMPLER_PROFILE_MEDIUM;
+        if (!tuner) {
+#if ROC_VERSION_MAJOR == 0 && ROC_VERSION_MINOR < 4
+            rcfg.clock_sync_backend = ROC_CLOCK_SYNC_BACKEND_DISABLE;
+#else
+            rcfg.latency_tuner_profile = ROC_LATENCY_TUNER_PROFILE_INTACT;
+#endif
+        }
         /* Un récepteur par protocole (libroc refuse de les mêler dans un même
          * récepteur) : flux corrigé (rs8m) si disponible, et flux simple. Leurs
          * sorties sont additionnées (un seul émetteur à la fois : pare-feu). */
