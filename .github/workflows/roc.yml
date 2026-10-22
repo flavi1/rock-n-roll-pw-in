@@ -1,0 +1,69 @@
+# ROC (optionnel) : vrais envois / réceptions d'un sinus avec libroc, sans PipeWire.
+# libroc 0.3 (Debian trixie, Ubuntu 24.04) et 0.4 (Ubuntu 26.04), et entre les deux
+# (Pi en 0.3, PC en 0.4). Pertes de paquets simulées (netem).
+name: ROC
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roc03:
+    name: libroc 0.3 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: libroc
+        run: sudo apt-get update && sudo apt-get install -y libroc-dev pkg-config "linux-modules-extra-$(uname -r)" || sudo apt-get install -y libroc-dev pkg-config
+      - name: Compilation
+        run: bash tests/test-roc.sh build
+      - name: "Sans perte (rs8m)"
+        run: ROC_CASE="0.3 rs8m 0%" sudo -E bash tests/test-roc.sh loop rs8m 0
+      - name: "5 % de pertes, corrigées (rs8m)"
+        run: sudo modprobe sch_netem; ROC_CASE="0.3 rs8m 5%" sudo -E bash tests/test-roc.sh loop rs8m 5
+      - name: "5 % de pertes sans correction : le banc les voit"
+        run: ROC_CASE="0.3 none 5%" sudo -E bash tests/test-roc.sh loop none 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roc03-bin
+          path: rock-n-roll-roc
+
+  roc04:
+    name: libroc 0.4 (Ubuntu 26.04) et 0.3 ↔ 0.4
+    runs-on: ubuntu-24.04
+    needs: roc03
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: roc03-bin
+      - name: libroc 0.3 (hôte) et conteneur 0.4
+        run: |
+          chmod +x rock-n-roll-roc && mv rock-n-roll-roc rock-n-roll-roc-03
+          sudo apt-get update && sudo apt-get install -y libroc-dev
+          docker run -d --name r04 --network host -v "$PWD:/w" -w /w ubuntu:26.04 sleep 3600
+          docker exec r04 bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc libc6-dev libroc-dev pkg-config python3 >/dev/null'
+          docker exec r04 bash -c 'BIN=/w/rock-n-roll-roc-04 bash tests/test-roc.sh build'
+      - name: "0.4 seul, 5 % de pertes"
+        run: |
+          sudo modprobe sch_netem || true
+          sudo tc qdisc add dev lo root netem loss 5% || true
+          docker exec -e GITHUB_ACTIONS=1 -e ROC_CASE="0.4 rs8m 5%" r04 bash -c 'BIN=/w/rock-n-roll-roc-04 bash tests/test-roc.sh loop rs8m 0'
+      - name: "Pi 0.3 reçoit, PC 0.4 envoie (5 % de pertes)"
+        run: |
+          (BIN=$PWD/rock-n-roll-roc-03 bash tests/test-roc.sh recv /tmp/r1.json) & rp=$!
+          sleep 1
+          docker exec r04 bash -c 'BIN=/w/rock-n-roll-roc-04 bash tests/test-roc.sh send 127.0.0.1' & sp=$!
+          wait $rp || true; kill $sp 2>/dev/null || true
+          python3 -c "import json;r=json.load(open('/tmp/r1.json'));ok=r['jumps']==0 and r['silent_blocks']==0 and abs(r['freq']-1000)<20;print(('::notice' if ok else '::error')+' title=ROC 0.4 vers 0.3::'+str(r));exit(0 if ok else 1)"
+      - name: "PC 0.3 envoie, Pi 0.4 reçoit (5 % de pertes)"
+        run: |
+          docker exec r04 bash -c 'BIN=/w/rock-n-roll-roc-04 bash tests/test-roc.sh recv /w/r2.json' & rp=$!
+          sleep 1
+          (BIN=$PWD/rock-n-roll-roc-03 bash tests/test-roc.sh send 127.0.0.1) & sp=$!
+          wait $rp || true; kill $sp 2>/dev/null || true
+          python3 -c "import json;r=json.load(open('r2.json'));ok=r['jumps']==0 and r['silent_blocks']==0 and abs(r['freq']-1000)<20;print(('::notice' if ok else '::error')+' title=ROC 0.3 vers 0.4::'+str(r));exit(0 if ok else 1)"
