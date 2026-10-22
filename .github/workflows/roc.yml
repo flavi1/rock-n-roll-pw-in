@@ -43,6 +43,12 @@ jobs:
         run: ROC_CASE="trixie <- u2404" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "env BIN=$PWD/r-u2404"
       - name: "Pi (trixie 0.3) reçoit, PC 26.04 (0.4) envoie"
         run: ROC_CASE="trixie <- u2604" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
+      - name: "Comparaison sans perte (informatif)"
+        continue-on-error: true
+        run: |
+          for o in "--resampler-profile medium" "--resampler-profile high" "--no-tuner"; do
+            ROC_RECV_OPTS="$o" ROC_CASE="trixie 0% $o" bash tests/test-roc.sh pair "docker exec -e ROC_RECV_OPTS trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie" || true
+          done
       - name: "Pertes simulées : 5 %"
         run: sudo tc qdisc add dev lo root netem loss 5%
       - name: "Debian trixie, 5 % de pertes : corrigées"
@@ -57,7 +63,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          for o in "--resampler-profile low" "--resampler-profile medium" "--resampler-profile high" "--resampler speex" "--no-tuner"; do
+          for o in "--resampler-profile medium" "--resampler-profile high" "--no-tuner"; do
             ROC_RECV_OPTS="$o" ROC_CASE="trixie 5% $o" bash tests/test-roc.sh pair "docker exec -e ROC_RECV_OPTS trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie" || true
           done
       - name: "Sans pertes simulées"

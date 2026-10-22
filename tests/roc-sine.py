@@ -72,7 +72,21 @@ def check(seconds, path):
     rms = math.sqrt(sum(x * x for x in win) / len(win)) if win else 0.0
     crossings = sum(1 for a, b in zip(win, win[1:]) if a < 0 <= b)
     freq = crossings / (len(win) / RATE) if win else 0.0
+    # amplitude du fondamental (1 kHz) et résidu (bruit + distorsion), par bloc
+    w = 2 * math.pi * FREQ / RATE
+    a1s, res2 = [], []
+    for b in blocks:
+        cs = sum(x * math.cos(w * i) for i, x in enumerate(b)) * 2 / len(b)
+        sn = sum(x * math.sin(w * i) for i, x in enumerate(b)) * 2 / len(b)
+        a1 = math.hypot(cs, sn)
+        a1s.append(a1)
+        res2.append(max(0.0, sum(x * x for x in b) / len(b) - a1 * a1 / 2))
+    a1 = sum(a1s) / len(a1s) if a1s else 0.0
+    resid = math.sqrt(sum(res2) / len(res2)) if res2 else 0.0
+    peak = max((abs(x) for x in win), default=0.0)
     res = {"frames": len(samples), "analysed_s": round(len(win) / RATE, 2),
+           "a1": round(a1, 4), "resid_db": round(20 * math.log10(max(resid, 1e-9) / (AMP / math.sqrt(2))), 1),
+           "peak": round(peak, 4),
            "silent_blocks": silent, "blocks": len(blocks), "jumps": jumps,
            "rms": round(rms, 4), "freq": round(freq, 1)}
     with open(path, "w") as f:
