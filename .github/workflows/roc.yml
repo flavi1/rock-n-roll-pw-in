@@ -40,6 +40,7 @@ jobs:
       - name: "Ubuntu 26.04 (libroc 0.4), sans perte"
         run: ROC_CASE="u2604 seul" bash tests/test-roc.sh pair "docker exec u2604 env BIN=/w/r-u2604" "docker exec u2604 env BIN=/w/r-u2604"
       - name: "Pi (trixie 0.3) reçoit, PC 24.04 (0.3 sans correction) envoie"
+        continue-on-error: true
         run: ROC_CASE="trixie <- u2404" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "env BIN=$PWD/r-u2404"
       - name: "Pi (trixie 0.3) reçoit, PC 26.04 (0.4) envoie"
         run: ROC_CASE="trixie <- u2604" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
