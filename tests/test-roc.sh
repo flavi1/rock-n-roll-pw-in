@@ -12,6 +12,7 @@ BIN="${BIN:-$PWD/rock-n-roll-roc}"
 SINE="$HERE/tests/roc-sine.py"
 SECS="${SECS:-9}"
 cmd="${1:?build|loop|send|recv}"
+ROC_CASE="${ROC_CASE:-}"
 
 build() {
     local flags
@@ -27,6 +28,14 @@ recv() {   # recv FICHIER-BILAN [FEC]
 
 send() {   # send IP [FEC]
     "$BIN" send --host "$1" --fec "${2:-rs8m}" -- python3 "$SINE" gen $((SECS + 3)) || true
+}
+
+# journaux de l'essai en annotations GitHub en cas d'échec (journaux de CI non lisibles)
+annotate() {   # annotate TITRE FICHIER
+    [[ -n "${GITHUB_ACTIONS:-}" && -s "$2" ]] || return 0
+    local msg
+    msg="$(tail -n 40 "$2" | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')"
+    echo "::warning title=$1::$msg"
 }
 
 verdict() {   # verdict FICHIER MAX-SAUTS MAX-BLOCS-SILENCIEUX
@@ -53,18 +62,24 @@ case "$cmd" in
             tc qdisc add dev lo root netem loss "${loss}%"
             trap 'tc qdisc del dev lo root 2>/dev/null || true' EXIT
         fi
-        recv "$res" "$fec" & rp=$!
+        rlog="$(mktemp)" slog="$(mktemp)"
+        recv "$res" "$fec" 2>"$rlog" & rp=$!
         sleep 1
-        send 127.0.0.1 "$fec" & sp=$!
+        send 127.0.0.1 "$fec" 2>"$slog" & sp=$!
         wait "$rp" || true
         kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
         echo "== FEC $fec, perte ${loss} %"
+        cat "$rlog" "$slog" >&2
+        if [[ ! -s "$res" ]]; then
+            annotate "réception ($ROC_CASE)" "$rlog"; annotate "envoi ($ROC_CASE)" "$slog"
+            echo "ÉCHEC : aucun bilan"; exit 1
+        fi
         if [[ "$fec" == none && "$loss" != 0 ]]; then
             # sans correction, les pertes DOIVENT s'entendre : le banc les voit-il ?
-            if GITHUB_ACTIONS= verdict "$res" 0 0 >/dev/null; then echo "ÉCHEC : pertes non détectées par le banc"; exit 1; fi
+            if GITHUB_ACTIONS='' verdict "$res" 0 0 >/dev/null; then echo "ÉCHEC : pertes non détectées par le banc"; exit 1; fi
             echo "OK    pertes bien visibles sans correction"
         else
-            verdict "$res" 0 0
+            verdict "$res" 0 0 || { annotate "réception ($ROC_CASE)" "$rlog"; annotate "envoi ($ROC_CASE)" "$slog"; exit 1; }
         fi
         ;;
     *) echo "commande inconnue : $cmd"; exit 2 ;;
