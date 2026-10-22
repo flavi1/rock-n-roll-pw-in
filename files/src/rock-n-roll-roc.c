@@ -382,6 +382,9 @@ int main(int argc, char **argv)
         /* rythme imposé par la commande (lecture du tube) : horloge de la Pi */
         rcfg.clock_source = ROC_CLOCK_SOURCE_EXTERNAL;
         rcfg.target_latency = (unsigned long long)latency_ms * 1000000ULL;
+        /* rattrapage de la dérive d'horloge : le rééchantillonneur Speex échoue à
+         * 192 kHz (« Ratio overflow ») ; celui de libroc fonctionne à toute fréquence */
+        rcfg.resampler_backend = ROC_RESAMPLER_BACKEND_BUILTIN;
         roc_receiver *rcv = NULL;
         if (roc_receiver_open(ctx, &rcfg, &rcv) != 0)
             die("roc_receiver_open a échoué");
