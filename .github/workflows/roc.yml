@@ -18,7 +18,7 @@ jobs:
     name: Envoi / réception réels (0.3, 0.4, avec et sans correction)
     runs-on: ubuntu-24.04
     env:
-      SECS: "9"
+      SECS: "11"
     steps:
       - uses: actions/checkout@v5
       - name: libroc sur l'hôte (Ubuntu 24.04) et conteneurs (Debian trixie, Ubuntu 26.04)
