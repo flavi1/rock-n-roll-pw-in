@@ -1,5 +1,7 @@
 # rock-n-roll-pw-in
 
+> **VIBE CODÉ ET NON TESTÉS.** La liaison RTP sans ROC fonctionne chez moi de façon stable.
+
 Réception, sur la Raspberry Pi, du son d'un PC par le réseau local, **sans perte et
 sans compression** : RTP, 192 kHz / 24 bits, tampon de 10 ms en Ethernet. En option
 (activée par défaut) : **ROC**, même fréquence, avec réparation des paquets perdus,
