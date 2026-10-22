@@ -5,16 +5,21 @@
 #
 #  Configuration : /etc/rock-n-roll-pw-in/pw-in.conf (+ local.conf)
 #
-#  sudo rock-n-roll-pw-in apply      génère et (re)démarre le récepteur RTP,
-#                                    met à jour le pare-feu
+#  sudo rock-n-roll-pw-in apply      génère et (re)démarre les récepteurs (RTP,
+#                                    ROC), met à jour le pare-feu
 #  sudo rock-n-roll-pw-in status     récepteur, émetteur en cours, flux
 #  rock-n-roll-pw-in check           valide la configuration
 #  rock-n-roll-pw-in generate DIR    écrit les fichiers générés dans DIR (tests)
+#  rock-n-roll-pw-in run-roc         lance le récepteur ROC (service rock-n-roll-roc)
 #
-#  Le récepteur tourne dans un processus PipeWire à part (service utilisateur
-#  rock-n-roll-rtp) : le relancer ne touche jamais au reste de la pile audio.
-#  Un seul émetteur à la fois : assuré par le pare-feu (ensemble nftables à une
-#  seule place, libérée quelques secondes après le dernier paquet).
+#  Chaque récepteur tourne dans son propre processus (services utilisateur
+#  rock-n-roll-rtp et rock-n-roll-roc) : en relancer un, ou une panne de l'un,
+#  ne touche jamais au reste de la pile audio.
+#  ROC (optionnel) : programme rock-n-roll-roc (libroc), compilé à l'installation ;
+#  s'il manque, seul RTP fonctionne.
+#  Un seul émetteur à la fois, tous protocoles confondus : assuré par le pare-feu
+#  (ensemble nftables à une seule place, libérée quelques secondes après le
+#  dernier paquet).
 # =============================================================================
 import configparser
 import json
@@ -28,9 +33,12 @@ CONF = os.environ.get("PW_IN_CONF", "/etc/rock-n-roll-pw-in/pw-in.conf")
 SOUND_CONF = os.environ.get("PW_IN_SOUND_CONF", "/etc/pi-sound-server/audio-hub.conf")
 NFT_FRAGMENT = "/etc/nftables.d/30-rock-n-roll-pw-in.nft"
 UNIT = "rock-n-roll-rtp.service"
+ROC_UNIT = "rock-n-roll-roc.service"
+ROC_BIN = os.environ.get("PW_IN_ROC_BIN", "/usr/local/bin/rock-n-roll-roc")
+ROC_NODE = "rock-n-roll.roc"
 PW_CONF_NAME = "rock-n-roll-rtp.conf"
 NODE_NAME = "rock-n-roll.rtp"
-NFT_SET = "rnr_rtp_sender"
+NFT_SET = "rnr_sender"
 HEADER = ("# Généré par « rock-n-roll-pw-in apply » depuis %s\n"
           "# NE PAS ÉDITER : modifiez le fichier source puis relancez « sudo rock-n-roll-pw-in apply ».\n\n")
 
@@ -39,7 +47,11 @@ DEFAULTS = {
     "rtp": {"enabled": "yes", "port": "46000", "latency-ms": "10", "rate": "192000",
             "format": "S24BE", "channels": "2", "release-seconds": "5",
             "description": "Réseau (RTP)"},
+    "roc": {"enabled": "yes", "source-port": "10001", "repair-port": "10002",
+            "plain-port": "10003", "fec": "auto", "latency-ms": "80", "rate": "192000",
+            "description": "Réseau (ROC)"},
 }
+FECS = ("auto", "rs8m", "ldpc", "none")
 RATES = (44100, 48000, 88200, 96000, 176400, 192000)
 FORMATS = ("S16BE", "S24BE")
 
@@ -104,6 +116,18 @@ class Config:
             die("[rtp] rate doit valoir %s" % ", ".join(map(str, RATES)))
         if r["format"] not in FORMATS:
             die("[rtp] format doit valoir %s" % " ou ".join(FORMATS))
+        o = self.v["roc"]
+        for k, lo, hi in (("source-port", 1024, 65535), ("repair-port", 1024, 65535),
+                          ("plain-port", 1024, 65535), ("latency-ms", 5, 5000)):
+            if not o[k].isdigit() or not lo <= int(o[k]) <= hi:
+                die("[roc] %s doit être un entier entre %d et %d" % (k, lo, hi))
+        ports = [int(o[k]) for k in ("source-port", "repair-port", "plain-port")] + [int(r["port"])]
+        if len(set(ports)) != len(ports):
+            die("[roc] / [rtp] : les ports doivent tous être différents")
+        if not o["rate"].isdigit() or int(o["rate"]) not in RATES:
+            die("[roc] rate doit valoir %s" % ", ".join(map(str, RATES)))
+        if o["fec"] not in FECS:
+            die("[roc] fec doit valoir %s" % ", ".join(FECS))
         if g["log-level"] not in ("0", "1", "2", "3", "4", "5"):
             die("[global] log-level doit être un entier de 0 à 5")
         self.log_level = int(g["log-level"])
@@ -123,6 +147,30 @@ class Config:
     @property
     def rtp_enabled(self):
         return yes(self.rtp["enabled"])
+
+    @property
+    def roc(self):
+        return self.v["roc"]
+
+    @property
+    def roc_wanted(self):
+        return yes(self.roc["enabled"])
+
+    @property
+    def roc_available(self):
+        return os.access(ROC_BIN, os.X_OK)
+
+    @property
+    def roc_enabled(self):
+        return self.roc_wanted and self.roc_available
+
+    def roc_ports(self):
+        o = self.roc
+        if o["fec"] == "none":
+            return [int(o["plain-port"])]
+        if o["fec"] == "auto":
+            return [int(o[k]) for k in ("source-port", "repair-port", "plain-port")]
+        return [int(o["source-port"]), int(o["repair-port"])]
 
 
 # --- SPA-JSON (format des fichiers PipeWire) ----------------------------------------
@@ -214,16 +262,72 @@ WantedBy=default.target
 """.format(port=c.rtp["port"], conf=PW_CONF_NAME)
 
 
+def gen_roc_unit(c):
+    return """# Généré par rock-n-roll-pw-in
+# Récepteur ROC (rock-n-roll-roc + pw-cat), processus à part : une panne ici ne
+# touche ni RTP ni le reste de la pile audio. Redémarrages limités.
+[Unit]
+Description=rock-n-roll : réception ROC (ports {ports})
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+PartOf=pipewire.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/local/bin/rock-n-roll-pw-in run-roc
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""".format(ports=", ".join(map(str, c.roc_ports())))
+
+
+def roc_argv(c):
+    """Commande du récepteur ROC : rock-n-roll-roc -> pw-cat -> MASTER."""
+    o = c.roc
+    props = json.dumps({
+        "node.name": ROC_NODE,
+        "node.description": o["description"],
+        "media.name": o["description"],
+        "application.name": o["description"],
+        # traiter même sans émetteur : le flux reste en place
+        "node.always-process": True,
+    }, ensure_ascii=False)
+    argv = [ROC_BIN, "recv", "--source-port", o["source-port"], "--repair-port", o["repair-port"],
+            "--plain-port", o["plain-port"], "--fec", o["fec"], "--rate", o["rate"],
+            "--latency-ms", o["latency-ms"]]
+    if c.log_level >= 3:
+        argv.append("-v")
+    argv += ["--", "pw-cat", "--playback", "--raw", "--format", "f32", "--rate", o["rate"],
+             "--channels", "2", "--target", c.target, "--latency", "10ms",
+             "--quality", str(c.quality), "-P", props, "-"]
+    return argv
+
+
+def nft_ports(c):
+    ports = []
+    if c.rtp_enabled:
+        ports.append(int(c.rtp["port"]))
+    if c.roc_enabled:
+        ports += c.roc_ports()
+    return ports
+
+
 def gen_nft(c):
-    """Fragment de pare-feu (pi-server) : réseau local, UN SEUL émetteur à la fois.
-    L'ensemble n'a qu'une place ; chaque paquet de l'émetteur en place renouvelle
-    son délai ; un autre émetteur est rejeté (ensemble plein) jusqu'à
-    release-seconds après le dernier paquet du premier."""
-    r = c.rtp
-    return ("# rock-n-roll-pw-in — RTP : réseau local, un seul émetteur à la fois\n"
+    """Fragment de pare-feu (pi-server) : réseau local, UN SEUL émetteur à la fois,
+    tous protocoles confondus (RTP et ROC partagent la place). L'ensemble n'a
+    qu'une place ; chaque paquet de l'émetteur en place renouvelle son délai ; un
+    autre émetteur est rejeté (ensemble plein) jusqu'à release-seconds après le
+    dernier paquet du premier."""
+    ports = nft_ports(c)
+    if not ports:
+        return None
+    return ("# rock-n-roll-pw-in — RTP / ROC : réseau local, un seul émetteur à la fois\n"
             "add set inet filter {s} {{ type ipv4_addr; size 1; flags dynamic,timeout; timeout {t}s; }}\n"
-            "add rule inet filter input ip saddr $LAN4 udp dport {p} update @{s} {{ ip saddr }} accept\n"
-            ).format(s=NFT_SET, t=r["release-seconds"], p=r["port"])
+            "add rule inet filter input ip saddr $LAN4 udp dport {{ {p} }} update @{s} {{ ip saddr }} accept\n"
+            ).format(s=NFT_SET, t=c.rtp["release-seconds"], p=", ".join(map(str, sorted(ports))))
 
 
 def generated_user_files(c):
@@ -231,6 +335,7 @@ def generated_user_files(c):
     return {
         ".config/pipewire/" + PW_CONF_NAME: gen_pw_conf(c),
         ".config/systemd/user/" + UNIT: gen_unit(c),
+        ".config/systemd/user/" + ROC_UNIT: gen_roc_unit(c),
     }
 
 
@@ -300,6 +405,15 @@ def cmd_check(c):
             r["port"], r["rate"], r["format"], r["channels"], r["latency-ms"], r["release-seconds"]))
     else:
         print("  RTP         : désactivé")
+    o = c.roc
+    if not c.roc_wanted:
+        print("  ROC         : désactivé")
+    else:
+        fec = {"auto": "correction rs8m si possible, sinon flux simple", "rs8m": "correction rs8m",
+               "ldpc": "correction LDPC", "none": "sans correction"}[o["fec"]]
+        print("  ROC         : ports UDP %s, %s Hz f32 stéréo, %s, latence %s ms%s" % (
+            ", ".join(map(str, c.roc_ports())), o["rate"], fec, o["latency-ms"],
+            "" if c.roc_available else " — INDISPONIBLE (%s absent : libroc non installée ?)" % ROC_BIN))
 
 
 def cmd_generate(c, outdir):
@@ -310,7 +424,10 @@ def cmd_generate(c, outdir):
         print("écrit", p)
     p = os.path.join(outdir, "nftables.d", os.path.basename(NFT_FRAGMENT))
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    open(p, "w", encoding="utf-8").write(gen_nft(c))
+    open(p, "w", encoding="utf-8").write(gen_nft(c) or "")
+    print("écrit", p)
+    p = os.path.join(outdir, "roc-argv.json")
+    open(p, "w", encoding="utf-8").write(json.dumps(roc_argv(c), ensure_ascii=False))
     print("écrit", p)
 
 
@@ -332,22 +449,35 @@ def cmd_apply(c):
     else:
         systemctl_user(c, "disable", "--now", UNIT)
         log("  %s : arrêté" % UNIT)
+    if c.roc_enabled:
+        systemctl_user(c, "reset-failed", ROC_UNIT)
+        systemctl_user(c, "enable", ROC_UNIT)
+        r = systemctl_user(c, "restart", ROC_UNIT)
+        log("  %s : %s" % (ROC_UNIT, "démarré" if r.returncode == 0 else "ÉCHEC (" + r.stderr.strip() + ")"))
+    else:
+        systemctl_user(c, "disable", "--now", ROC_UNIT)
+        if c.roc_wanted:
+            log("  %s : non démarré (%s absent : ROC indisponible, RTP fonctionne normalement)"
+                % (ROC_UNIT, ROC_BIN))
+        else:
+            log("  %s : arrêté" % ROC_UNIT)
     # pare-feu
+    want = gen_nft(c)
     if firewall_present():
-        if c.rtp_enabled:
-            want = gen_nft(c)
+        if want:
             old = open(NFT_FRAGMENT).read() if os.path.exists(NFT_FRAGMENT) else None
             if old != want:
                 open(NFT_FRAGMENT, "w").write(want)
-                log("  pare-feu : port UDP %s, réseau local, un seul émetteur" % c.rtp["port"])
+                log("  pare-feu : ports UDP %s, réseau local, un seul émetteur"
+                    % ", ".join(map(str, sorted(nft_ports(c)))))
                 reload_firewall()
         elif os.path.exists(NFT_FRAGMENT):
             os.remove(NFT_FRAGMENT)
-            log("  pare-feu : port RTP refermé")
+            log("  pare-feu : ports refermés")
             reload_firewall()
-    elif c.rtp_enabled:
-        log("  ATTENTION : pas de pare-feu pi-server : le port UDP %s n'est pas filtré et "
-            "plusieurs émetteurs pourraient se mélanger" % c.rtp["port"])
+    elif want:
+        log("  ATTENTION : pas de pare-feu pi-server : les ports UDP %s ne sont pas filtrés et "
+            "plusieurs émetteurs pourraient se mélanger" % ", ".join(map(str, sorted(nft_ports(c)))))
 
 
 def is_true(v):
@@ -355,25 +485,40 @@ def is_true(v):
     return v is True or str(v).strip().lower() == "true"
 
 
-def receiving_state(c):
-    """(nœud présent ?, rtp.receiving) depuis pw-dump."""
+def pw_nodes(c):
+    """node.name -> (props, état) depuis pw-dump ; None si PipeWire ne répond pas."""
     r = as_user(c, ["pw-dump"])
     if r.returncode != 0:
-        return None, None
+        return None
     try:
         objs = json.loads(r.stdout)
     except ValueError:
-        return None, None
+        return None
+    out = {}
     for o in objs:
-        props = (o.get("info") or {}).get("props") or {}
-        if props.get("node.name") == NODE_NAME:
-            return True, props.get("rtp.receiving")
+        info = o.get("info") or {}
+        props = info.get("props") or {}
+        if "node.name" in props:
+            out[props["node.name"]] = (props, info.get("state"))
+    return out
+
+
+def receiving_state(c, nodes=None):
+    """(nœud présent ?, rtp.receiving) depuis pw-dump."""
+    nodes = pw_nodes(c) if nodes is None else nodes
+    if nodes is None:
+        return None, None
+    if NODE_NAME in nodes:
+        return True, nodes[NODE_NAME][0].get("rtp.receiving")
     return False, None
 
 
 def current_sender():
     r = subprocess.run(["nft", "-j", "list", "set", "inet", "filter", NFT_SET],
                        text=True, capture_output=True)
+    if r.returncode != 0:      # nom des versions précédentes
+        r = subprocess.run(["nft", "-j", "list", "set", "inet", "filter", "rnr_rtp_sender"],
+                           text=True, capture_output=True)
     if r.returncode != 0:
         return None
     try:
@@ -392,14 +537,20 @@ def cmd_status(c):
     if c.uid is None:
         return
     r = systemctl_user(c, "is-active", UNIT)
-    print("  service     : %s" % (r.stdout.strip() or "inconnu"))
-    present, recv = receiving_state(c)
+    print("  service RTP : %s" % (r.stdout.strip() or "inconnu"))
+    nodes = pw_nodes(c)
+    present, recv = receiving_state(c, nodes)
     if present is None:
         print("  PipeWire    : ne répond pas")
     elif not present:
-        print("  flux        : absent")
+        print("  flux RTP    : absent")
     else:
-        print("  flux        : %s" % ("en réception" if is_true(recv) else "en attente d'un émetteur"))
+        print("  flux RTP    : %s" % ("en réception" if is_true(recv) else "en attente d'un émetteur"))
+    if c.roc_wanted:
+        r = systemctl_user(c, "is-active", ROC_UNIT)
+        print("  service ROC : %s" % (r.stdout.strip() or "inconnu"))
+        if nodes is not None:
+            print("  flux ROC    : %s" % ("présent" if ROC_NODE in nodes else "absent"))
     s = current_sender()
     if s is None:
         print("  émetteur    : (pare-feu pi-server absent ou illisible)")
@@ -424,6 +575,11 @@ def main():
         cmd_apply(c)
     elif a[0] == "status":
         cmd_status(c)
+    elif a[0] == "run-roc":
+        if not c.roc_available:
+            die("%s absent : ROC indisponible" % ROC_BIN)
+        argv = roc_argv(c)
+        os.execv(argv[0], argv)
     else:
         die("commande inconnue : %s" % a[0])
 

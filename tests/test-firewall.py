@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CMD = os.path.join(HERE, "..", "files", "bin", "rock-n-roll-pw-in")
 PORT = 46000
 RELEASE = 2
+ROC_PORT = 10001
 
 if os.geteuid() != 0:
     print("root requis")
@@ -68,7 +69,12 @@ with tempfile.TemporaryDirectory() as w:
         "define LAN4 = { 127.0.0.2, 127.0.0.3 }\ndefine LAN6 = { fe80::/10, fc00::/7 }\n")
     conf = os.path.join(w, "pw-in.conf")
     open(conf, "w").write("[rtp]\nport = %d\nrelease-seconds = %d\n" % (PORT, RELEASE))
-    env = dict(os.environ, PW_IN_CONF=conf, PW_IN_SOUND_CONF=os.path.join(w, "absent"))
+    # programme ROC simulé : le pare-feu doit aussi ouvrir les ports ROC
+    fake = os.path.join(w, "roc")
+    open(fake, "w").write("#!/bin/sh\nexit 0\n")
+    os.chmod(fake, 0o755)
+    env = dict(os.environ, PW_IN_CONF=conf, PW_IN_SOUND_CONF=os.path.join(w, "absent"),
+               PW_IN_ROC_BIN=fake)
     subprocess.run([sys.executable, CMD, "generate", w], env=env, check=True, capture_output=True)
     main = os.path.join(w, "nftables.conf")
     open(main, "w").write(PI_SERVER.format(d=d))
@@ -81,17 +87,20 @@ with tempfile.TemporaryDirectory() as w:
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.bind(("127.0.0.1", PORT))
     rx.settimeout(0.3)
+    rxroc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rxroc.bind(("127.0.0.1", ROC_PORT))
+    rxroc.settimeout(0.3)
     senders = {}
     for ip in ("127.0.0.2", "127.0.0.3", "127.0.0.4"):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.bind((ip, 0))
         senders[ip] = s
 
-    def send(ip):
+    def send(ip, port=PORT):
         """Envoie un paquet depuis ip ; renvoie l'adresse reçue (ou None)."""
-        senders[ip].sendto(b"rtp", ("127.0.0.1", PORT))
+        senders[ip].sendto(b"rtp", ("127.0.0.1", port))
         try:
-            return rx.recvfrom(64)[1][0]
+            return (rx if port == PORT else rxroc).recvfrom(64)[1][0]
         except socket.timeout:
             return None
 
@@ -109,9 +118,15 @@ with tempfile.TemporaryDirectory() as w:
     time.sleep(RELEASE + 0.5)
     check(send("127.0.0.3") == "127.0.0.3", "place libérée %d s après le dernier paquet : 2e émetteur accepté" % RELEASE)
     check(send("127.0.0.2") is None, "l'ancien émetteur est refusé à son tour")
-    out = subprocess.run(["nft", "list", "set", "inet", "filter", "rnr_rtp_sender"],
+    out = subprocess.run(["nft", "list", "set", "inet", "filter", "rnr_sender"],
                          text=True, capture_output=True).stdout
     check("127.0.0.3" in out, "émetteur en place visible (« rock-n-roll-pw-in status »)")
+    # RTP et ROC partagent la place : un émetteur ROC bloque un autre émetteur RTP
+    check(send("127.0.0.3", ROC_PORT) == "127.0.0.3", "le même émetteur peut passer en ROC")
+    check(send("127.0.0.2", ROC_PORT) is None, "un autre émetteur est refusé en ROC aussi")
+    time.sleep(RELEASE + 0.5)
+    check(send("127.0.0.2", ROC_PORT) == "127.0.0.2", "ROC : place libérée puis prise")
+    check(send("127.0.0.3") is None, "émetteur ROC en place : un autre émetteur RTP est refusé")
 
 print()
 print("%d échec(s)" % FAILS)

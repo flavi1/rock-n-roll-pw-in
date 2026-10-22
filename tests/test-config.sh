@@ -9,7 +9,7 @@ W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 FAILS=0
 ok()   { echo "  ok   : $*"; }
 fail() { echo "  FAIL : $*"; FAILS=$((FAILS+1)); }
-export PW_IN_CONF="$W/conf/pw-in.conf" PW_IN_SOUND_CONF="$W/none.conf"
+export PW_IN_CONF="$W/conf/pw-in.conf" PW_IN_SOUND_CONF="$W/none.conf" PW_IN_ROC_BIN="$W/absent"
 mkdir -p "$W/conf"
 cp "$HERE/pw-in.conf" "$PW_IN_CONF"
 
@@ -31,7 +31,36 @@ grep -q 'log.level = 2' "$PWC" && ok "journal : avertissements" || fail "log.lev
 grep -q 'resample.quality = 10' "$PWC" && ok "qualité 10 (pi-sound-server par défaut)" || fail "qualité"
 grep -q 'ExecStart=/usr/bin/pipewire -c rock-n-roll-rtp.conf' "$UNIT" && ok "processus PipeWire séparé" || fail "ExecStart"
 grep -q 'size 1;' "$NFT" && grep -q 'timeout 5s' "$NFT" && ok "pare-feu : 1 place, libérée après 5 s" || fail "fragment nft"
-grep -q 'ip saddr $LAN4 udp dport 46000' "$NFT" && ok "pare-feu : réseau local seulement" || fail "LAN4"
+grep -q 'ip saddr $LAN4 udp dport { 46000 }' "$NFT" && ok "pare-feu : réseau local, RTP seul (ROC indisponible)" || fail "LAN4"
+"${CMD[@]}" check | grep -q "ROC.*INDISPONIBLE" && ok "ROC sans programme : signalé indisponible" || fail "ROC indisponible non signalé"
+
+echo "== ROC (programme présent)"
+printf '#!/bin/sh\nexit 0\n' > "$W/roc"; chmod +x "$W/roc"
+PW_IN_ROC_BIN="$W/roc" "${CMD[@]}" generate "$W/genr" >/dev/null
+NR="$W/genr/nftables.d/30-rock-n-roll-pw-in.nft"
+grep -q 'udp dport { 10001, 10002, 10003, 46000 } update @rnr_sender' "$NR" \
+    && ok "pare-feu : RTP + ROC, une seule place pour tous" || fail "ports ROC : $(cat "$NR")"
+RU="$W/genr/.config/systemd/user/rock-n-roll-roc.service"
+grep -q 'ExecStart=/usr/local/bin/rock-n-roll-pw-in run-roc' "$RU" && grep -q 'StartLimitBurst=5' "$RU" \
+    && ok "service ROC séparé, redémarrages limités" || fail "service ROC"
+python3 - "$W/genr/roc-argv.json" <<'PY' && ok "commande ROC : 192 kHz, auto, vers MASTER, sans attendre d'émetteur" || fail "argv ROC"
+import json, sys
+a = json.load(open(sys.argv[1]))
+assert a[1] == "recv" and a[a.index("--fec") + 1] == "auto" and a[a.index("--rate") + 1] == "192000"
+i = a.index("--")
+pw = a[i + 1:]
+assert pw[:3] == ["pw-cat", "--playback", "--raw"] and pw[pw.index("--target") + 1] == "MASTER"
+assert pw[pw.index("--format") + 1] == "f32" and pw[pw.index("--quality") + 1] == "10"
+p = json.loads(pw[pw.index("-P") + 1])
+assert p["node.name"] == "rock-n-roll.roc" and p["node.always-process"] is True
+PY
+printf '[roc]\nfec = none\n' > "$W/conf/local.conf"
+PW_IN_ROC_BIN="$W/roc" "${CMD[@]}" generate "$W/genr2" >/dev/null
+grep -q 'udp dport { 10003, 46000 }' "$W/genr2/nftables.d/30-rock-n-roll-pw-in.nft" && ok "fec = none : seul le port simple" || fail "fec none"
+printf '[roc]\nenabled = no\n' > "$W/conf/local.conf"
+PW_IN_ROC_BIN="$W/roc" "${CMD[@]}" generate "$W/genr3" >/dev/null
+grep -q 'udp dport { 46000 }' "$W/genr3/nftables.d/30-rock-n-roll-pw-in.nft" && ok "ROC désactivé : ports fermés" || fail "ROC désactivé"
+rm -f "$W/conf/local.conf"
 
 echo "== valeurs reprises de pi-sound-server"
 cat > "$W/sound.conf" <<'EOF'
@@ -64,7 +93,9 @@ bad "fréquence invalide" rtp "rate = 50000"
 bad "format invalide" rtp "format = F32"
 bad "port invalide" rtp "port = 80"
 bad "option inconnue" rtp "portt = 46000"
-bad "section inconnue" roc "enabled = yes"
+bad "section inconnue" foo "enabled = yes"
+bad "ROC : ports en double" roc "plain-port = 46000"
+bad "ROC : fec invalide" roc "fec = xor"
 cp "$HERE/pw-in.conf" "$W/conf/pw-in.conf"
 
 echo "== état du flux (pw-dump)"
