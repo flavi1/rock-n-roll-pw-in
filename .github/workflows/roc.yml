@@ -43,19 +43,22 @@ jobs:
         run: ROC_CASE="trixie <- u2404" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "env BIN=$PWD/r-u2404"
       - name: "Pi (trixie 0.3) reçoit, PC 26.04 (0.4) envoie"
         run: ROC_CASE="trixie <- u2604" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604"
-      - name: "Comparaison sans perte (informatif)"
+      - name: "Dérive d'horloge réaliste ±100 ppm, 120 s (informatif)"
         continue-on-error: true
         run: |
-          for o in "--resampler speex --no-tuner" "--resampler default --no-tuner" "--resampler-profile high" "--no-tuner"; do
-            ROC_RECV_OPTS="$o" ROC_CASE="trixie 0% $o" bash tests/test-roc.sh pair "docker exec -e ROC_RECV_OPTS trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie" || true
+          for d in 100 -100; do
+            SECS=120 ROC_DRIFT_PPM=$d ROC_CASE="trixie dérive $d ppm" bash tests/test-roc.sh pair "docker exec -e SECS trixie env BIN=/w/r-trixie" "docker exec -e ROC_DRIFT_PPM -e SECS trixie env BIN=/w/r-trixie" || true
           done
-      - name: "Dérive d'horloge ±2000 ppm, 45 s (informatif)"
+      - name: "48 kHz, Speex (comparaison, informatif)"
         continue-on-error: true
+        run: |
+          ROC_RATE=48000 ROC_RECV_OPTS="--resampler speex" ROC_CASE="trixie 48k speex" bash tests/test-roc.sh pair "docker exec -e ROC_RATE -e ROC_RECV_OPTS trixie env BIN=/w/r-trixie" "docker exec -e ROC_RATE trixie env BIN=/w/r-trixie" || true
+          SECS=120 ROC_DRIFT_PPM=100 ROC_RATE=48000 ROC_RECV_OPTS="--resampler speex" ROC_CASE="trixie 48k speex dérive 100 ppm" bash tests/test-roc.sh pair "docker exec -e ROC_RATE -e ROC_RECV_OPTS -e SECS trixie env BIN=/w/r-trixie" "docker exec -e ROC_RATE -e ROC_DRIFT_PPM -e SECS trixie env BIN=/w/r-trixie" || true
+      - name: "Dérive extrême ±2000 ppm, 45 s : jamais de valeur aberrante (garde-fou)"
         run: |
           for d in 2000 -2000; do
-            for o in "--resampler speex --no-tuner" "--resampler-profile high"; do
-              SECS=45 ROC_DRIFT_PPM=$d ROC_RECV_OPTS="$o" ROC_CASE="trixie dérive $d ppm $o" bash tests/test-roc.sh pair "docker exec -e ROC_RECV_OPTS -e SECS trixie env BIN=/w/r-trixie" "docker exec -e ROC_DRIFT_PPM -e SECS trixie env BIN=/w/r-trixie" || true
-            done
+            SECS=45 ROC_DRIFT_PPM=$d ROC_CASE="trixie dérive extrême $d ppm" bash tests/test-roc.sh pair "docker exec -e SECS trixie env BIN=/w/r-trixie" "docker exec -e ROC_DRIFT_PPM -e SECS trixie env BIN=/w/r-trixie" || true
+            python3 -c "import json,sys;r=json.load(open('roc-res.json'));ok=r['peak']<=1.0;print(('::notice' if ok else '::error')+' title=Garde-fou '+sys.argv[1]+' ppm::crête '+str(r['peak']));sys.exit(0 if ok else 1)" $d
           done
       - name: "Pertes simulées : 5 %"
         run: sudo tc qdisc add dev lo root netem loss 5%
@@ -67,13 +70,6 @@ jobs:
       - name: "Pi (trixie) reçoit, PC 26.04 (sans correction) envoie, 5 % de pertes : audibles"
         if: always()
         run: ROC_CASE="trixie <- u2604 5%" bash tests/test-roc.sh pair "docker exec trixie env BIN=/w/r-trixie" "docker exec u2604 env BIN=/w/r-u2604" auto glitches
-      - name: "Comparaison avec pertes (informatif)"
-        if: always()
-        continue-on-error: true
-        run: |
-          for o in "--resampler speex --no-tuner" "--resampler-profile high"; do
-            ROC_RECV_OPTS="$o" ROC_CASE="trixie 5% $o" bash tests/test-roc.sh pair "docker exec -e ROC_RECV_OPTS trixie env BIN=/w/r-trixie" "docker exec trixie env BIN=/w/r-trixie" || true
-          done
       - name: "Sans pertes simulées"
         if: always()
         run: sudo tc qdisc del dev lo root

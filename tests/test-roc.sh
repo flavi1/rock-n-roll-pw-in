@@ -15,7 +15,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$PWD/rock-n-roll-roc}"
-SECS="${SECS:-9}"
+SECS="${SECS:-11}"
+RATE="${ROC_RATE:-192000}"
 ROC_CASE="${ROC_CASE:-}"
 cmd="${1:?build|loop|pair|recv|send}"
 
@@ -23,18 +24,18 @@ build() {
     local flags
     flags="$(pkg-config --cflags --libs roc 2>/dev/null || echo -lroc)"
     # shellcheck disable=SC2086
-    gcc -std=c99 -O2 -Wall -Wextra -Werror -o "$BIN" "$HERE/files/src/rock-n-roll-roc.c" $flags
+    gcc -std=c99 -O2 -Wall -Wextra -Werror -o "$BIN" "$HERE/files/src/rock-n-roll-roc.c" $flags -lm
     echo "compilé : $BIN (libroc $(pkg-config --modversion roc 2>/dev/null || echo '?'))"
 }
 
 # chemins relatifs : valables sur l'hôte et dans les conteneurs (/w = dépôt)
 recv() {   # recv FICHIER-BILAN [FEC]
     # shellcheck disable=SC2086
-    "$BIN" recv --fec "${2:-auto}" --latency-ms 100 ${ROC_RECV_OPTS:-} -- python3 tests/roc-sine.py check "$SECS" "$1"
+    "$BIN" recv --fec "${2:-auto}" --rate "$RATE" --latency-ms 100 ${ROC_RECV_OPTS:-} -- python3 tests/roc-sine.py check "$SECS" "$1"
 }
 
 send() {   # send IP [FEC]
-    "$BIN" send --host "$1" --fec "${2:-auto}" -- python3 tests/roc-sine.py gen $((SECS + 3)) || true
+    "$BIN" send --host "$1" --fec "${2:-auto}" --rate "$RATE" -- python3 tests/roc-sine.py gen $((SECS + 3)) || true
 }
 
 # journaux de l'essai en annotations GitHub (les journaux de CI ne sont pas toujours lisibles)
@@ -53,9 +54,11 @@ try:
 except (OSError, ValueError):
     r = None
 want = sys.argv[2]
+# propre : aucun trou ni saut, bonne fréquence, niveau juste (±0,1 dB), résidu < -40 dB
 clean = bool(r) and r["analysed_s"] > 5 and r["jumps"] == 0 and r["silent_blocks"] == 0 \
-    and abs(r["freq"] - 1000) < 20
-ok = clean if want == "clean" else (bool(r) and r["analysed_s"] > 5 and not clean)
+    and abs(r["freq"] - 1000) < 20 and abs(r["a1"] - 0.5) < 0.006 and r["resid_db"] < -40
+glitchy = bool(r) and r["analysed_s"] > 5 and (r["jumps"] > 0 or r["silent_blocks"] > 0)
+ok = clean if want == "clean" else glitchy
 case = os.environ.get("ROC_CASE", "")
 print(("OK   " if ok else "ÉCHEC"), want, r)
 if os.environ.get("GITHUB_ACTIONS"):

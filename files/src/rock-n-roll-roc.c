@@ -33,12 +33,20 @@
  *  sinon le flux simple. Toutes les combinaisons fonctionnent ; la correction
  *  n'est active que si les deux côtés l'ont.
  *
+ *  Sécurité (réception) : toute valeur invalide (NaN, infinie) est remplacée par
+ *  du silence et la sortie est bornée à ±1 (pleine échelle) : jamais de bruit à
+ *  pleine puissance vers les enceintes. Si libroc produit des valeurs aberrantes
+ *  plus de 0,1 s de suite, le programme s'arrête (systemd le relance, état neuf).
+ *  Le rééchantillonneur intégré de libroc (rattrapage de dérive) amplifie de
+ *  1/0,9 (coupure à 0,9 non compensée, toutes versions) : corrigé ici (× 0,9).
+ *
  *  Format sur le tube : flottant 32 bits, ordre de la machine, 2 canaux
  *  entrelacés (pw-cat --raw --format f32 --channels 2).
  * =============================================================================
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -437,6 +445,9 @@ int main(int argc, char **argv)
                 desc, rate, latency_ms);
 
         float tmp[CHUNK_FRAMES * CHANNELS];
+        /* gain du rééchantillonneur intégré de libroc : 1 / 0,9 */
+        const float gain = rcfg.resampler_backend == ROC_RESAMPLER_BACKEND_BUILTIN ? 0.9f : 1.0f;
+        int bad_chunks = 0;
         int out = spawn(&argv[cmd], 1);
         while (!stop_requested) {
             int first = 1;
@@ -453,6 +464,28 @@ int main(int argc, char **argv)
                     for (size_t i = 0; i < CHUNK_FRAMES * CHANNELS; i++)
                         buf[i] += tmp[i];
                 first = 0;
+            }
+            /* garde-fou : jamais de valeur invalide ni au-delà de la pleine échelle */
+            int bad = 0;
+            for (size_t i = 0; i < CHUNK_FRAMES * CHANNELS; i++) {
+                float x = buf[i] * gain;
+                if (!isfinite(x) || x > 4.0f || x < -4.0f) {
+                    bad = 1;
+                    break;
+                }
+                buf[i] = x > 1.0f ? 1.0f : (x < -1.0f ? -1.0f : x);
+            }
+            if (bad) {
+                memset(buf, 0, sizeof(buf));
+                if (++bad_chunks == 1)
+                    fprintf(stderr, "rock-n-roll-roc : valeurs aberrantes de libroc : silence\n");
+                if (bad_chunks > 40) {          /* 0,1 s */
+                    fprintf(stderr, "rock-n-roll-roc : libroc divague : arrêt (redémarrage par systemd)\n");
+                    rc = 1;
+                    break;
+                }
+            } else {
+                bad_chunks = 0;
             }
             if (write_all(out, buf, sizeof(buf)) != 0) {
                 if (!stop_requested) {

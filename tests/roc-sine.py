@@ -12,7 +12,7 @@ import struct
 import sys
 import time
 
-RATE = 192000
+RATE = int(os.environ.get("ROC_RATE", "192000"))
 FREQ = 1000.0
 AMP = 0.5
 CHUNK = 960                    # 5 ms
@@ -115,9 +115,9 @@ def check(seconds, path):
         delay = t0 + n / RATE - time.monotonic()
         if delay > 0:
             time.sleep(delay)
-    skip = int(2.5 * RATE)                                # après mise en route
+    skip = int(4 * RATE)                                  # après mise en route
     res = {"frames": len(samples)}
-    res.update(analyse(samples[skip:], 2.5))
+    res.update(analyse(samples[skip:], 4.0))
     with open(path, "w") as f:
         json.dump(res, f)
     print(json.dumps(res), file=sys.stderr)
